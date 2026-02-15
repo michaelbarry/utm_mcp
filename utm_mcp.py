@@ -218,14 +218,24 @@ class UsbDisconnectInput(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+# Subcommands that accept the --hide flag (EnvironmentOptions in utmctl).
+# The "file" and "usb" subcommands have their own sub-parsers and do NOT
+# accept --hide, so we must omit it for those.
+_HIDE_SUPPORTED_SUBCOMMANDS = {
+    "list", "start", "stop", "suspend", "delete", "clone",
+    "status", "ip-address", "exec",
+}
+
+
 async def _run_utmctl(*args: str, stdin_data: Optional[str] = None) -> str:
     """
     Execute a utmctl command and return its combined stdout/stderr output.
 
-    Always passes --hide to prevent the UTM window from appearing.
+    Passes --hide for subcommands that support it to prevent the UTM
+    window from appearing.
 
     Args:
-        *args: Arguments to pass to utmctl after --hide.
+        *args: Arguments to pass to utmctl.
         stdin_data: Optional string to pipe into stdin.
 
     Returns:
@@ -234,11 +244,13 @@ async def _run_utmctl(*args: str, stdin_data: Optional[str] = None) -> str:
     Raises:
         RuntimeError: If the command exits with a non-zero status.
     """
-    # --hide must follow the subcommand, not precede it.
-    # args[0] is the subcommand (e.g. "list", "start"), remaining are its arguments.
     arg_list = list(args)
     if arg_list:
-        cmd = [UTMCTL_PATH, arg_list[0], "--hide"] + arg_list[1:]
+        subcommand = arg_list[0]
+        if subcommand in _HIDE_SUPPORTED_SUBCOMMANDS:
+            cmd = [UTMCTL_PATH, subcommand, "--hide"] + arg_list[1:]
+        else:
+            cmd = [UTMCTL_PATH] + arg_list
     else:
         cmd = [UTMCTL_PATH]
     logger.info("Running: %s", " ".join(cmd))
@@ -711,3 +723,4 @@ async def utm_disconnect_usb(params: UsbDisconnectInput) -> str:
 
 if __name__ == "__main__":
     mcp.run()
+
