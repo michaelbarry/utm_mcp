@@ -244,18 +244,35 @@ class UsbDisconnectInput(BaseModel):
 
 # Subcommands that accept the --hide flag (EnvironmentOptions in utmctl).
 # "file" and "usb" subcommands do NOT accept --hide.
+# "start" supports --hide but it causes ~7s delays and OSStatus -10004
+# errors on some UTM versions (Apple Events timeout), so we skip it.
 _HIDE_SUPPORTED_SUBCOMMANDS = {
-    "list", "start", "stop", "suspend", "delete", "clone",
+    "list", "stop", "suspend", "delete", "clone",
     "status", "ip-address", "exec",
 }
 
 
-async def _run_utmctl(*args: str, stdin_data: Optional[str] = None) -> str:
+# Default timeout in seconds for utmctl commands. Start/stop may take
+# longer than simple queries, but anything beyond 30s is likely hung.
+_UTMCTL_TIMEOUT = 30
+
+
+async def _run_utmctl(
+    *args: str,
+    stdin_data: Optional[str] = None,
+    timeout: Optional[float] = None,
+) -> str:
     """Execute a utmctl command and return stdout.
 
     Automatically passes --hide for subcommands that support it to
     prevent the UTM window from stealing focus.
+
+    Times out after _UTMCTL_TIMEOUT seconds (default 30) to prevent
+    indefinite hangs when UTM.app is unresponsive or not running.
     """
+    if timeout is None:
+        timeout = _UTMCTL_TIMEOUT
+
     arg_list = list(args)
     if arg_list:
         subcommand = arg_list[0]
@@ -275,7 +292,22 @@ async def _run_utmctl(*args: str, stdin_data: Optional[str] = None) -> str:
     )
 
     stdin_bytes = stdin_data.encode("utf-8") if stdin_data is not None else None
-    stdout, stderr = await process.communicate(input=stdin_bytes)
+    try:
+        stdout, stderr = await asyncio.wait_for(
+            process.communicate(input=stdin_bytes),
+            timeout=timeout,
+        )
+    except asyncio.TimeoutError:
+        # Kill the hung process
+        try:
+            process.kill()
+            await process.wait()
+        except ProcessLookupError:
+            pass
+        raise RuntimeError(
+            f"utmctl timed out after {timeout}s running: {' '.join(cmd)}. "
+            f"Is UTM.app running in the current user session?"
+        )
 
     stdout_text = stdout.decode("utf-8", errors="replace").strip()
     stderr_text = stderr.decode("utf-8", errors="replace").strip()
@@ -294,6 +326,8 @@ def _format_error(e: Exception) -> str:
         return f"Error: {e}"
     if isinstance(e, FileNotFoundError):
         return f"Error: utmctl not found at {UTMCTL_PATH}. Is UTM installed?"
+    if isinstance(e, asyncio.TimeoutError):
+        return "Error: utmctl timed out. Is UTM.app running in the current user session?"
     return f"Error: {type(e).__name__}: {e}"
 
 
