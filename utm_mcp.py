@@ -2,8 +2,15 @@
 """
 MCP Server for UTM Virtual Machine Management.
 
-Provides tools to manage UTM virtual machines via the utmctl CLI,
-including lifecycle management, guest operations, and USB device handling.
+Provides tools to manage UTM virtual machines on macOS via the utmctl CLI.
+
+The only host requirement is UTM.app installed at the default location.
+
+Tools are grouped into three categories:
+- VM lifecycle (list/start/stop/suspend/clone/delete) — always available.
+- Guest operations (exec/script/file push/pull) — require the QEMU guest
+  agent to be running *inside* the VM. The agent runs as root.
+- USB passthrough (list/connect/disconnect) — always available.
 """
 
 import asyncio
@@ -20,7 +27,6 @@ from mcp.server.fastmcp import FastMCP
 
 UTMCTL_PATH = "/Applications/UTM.app/Contents/MacOS/utmctl"
 
-# Logging goes to stderr so it does not interfere with stdio transport
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -150,6 +156,25 @@ class ExecInput(BaseModel):
     )
 
 
+class ExecScriptInput(BaseModel):
+    """Input for pushing and executing a multi-line script on a guest VM."""
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    identifier: str = Field(
+        ...,
+        description="UUID or complete name of the virtual machine",
+        min_length=1,
+    )
+    script: str = Field(
+        ...,
+        description="Script content to execute (bash by default)",
+    )
+    interpreter: str = Field(
+        default="/bin/bash",
+        description="Interpreter to run the script (e.g. '/bin/bash', '/usr/bin/python3')",
+    )
+
+
 class FilePullInput(BaseModel):
     """Input for pulling a file from a guest VM."""
     model_config = ConfigDict(str_strip_whitespace=True)
@@ -217,10 +242,8 @@ class UsbDisconnectInput(BaseModel):
 # Shared Helpers
 # ---------------------------------------------------------------------------
 
-
 # Subcommands that accept the --hide flag (EnvironmentOptions in utmctl).
-# The "file" and "usb" subcommands have their own sub-parsers and do NOT
-# accept --hide, so we must omit it for those.
+# "file" and "usb" subcommands do NOT accept --hide.
 _HIDE_SUPPORTED_SUBCOMMANDS = {
     "list", "start", "stop", "suspend", "delete", "clone",
     "status", "ip-address", "exec",
@@ -228,21 +251,10 @@ _HIDE_SUPPORTED_SUBCOMMANDS = {
 
 
 async def _run_utmctl(*args: str, stdin_data: Optional[str] = None) -> str:
-    """
-    Execute a utmctl command and return its combined stdout/stderr output.
+    """Execute a utmctl command and return stdout.
 
-    Passes --hide for subcommands that support it to prevent the UTM
-    window from appearing.
-
-    Args:
-        *args: Arguments to pass to utmctl.
-        stdin_data: Optional string to pipe into stdin.
-
-    Returns:
-        The command's stdout output as a string.
-
-    Raises:
-        RuntimeError: If the command exits with a non-zero status.
+    Automatically passes --hide for subcommands that support it to
+    prevent the UTM window from stealing focus.
     """
     arg_list = list(args)
     if arg_list:
@@ -285,15 +297,15 @@ def _format_error(e: Exception) -> str:
     return f"Error: {type(e).__name__}: {e}"
 
 
-# ---------------------------------------------------------------------------
+# ===========================================================================
 # Tools: VM Lifecycle
-# ---------------------------------------------------------------------------
+# ===========================================================================
 
 
 @mcp.tool(
     name="utm_list_vms",
     annotations={
-        "title": "List UTM Virtual Machines",
+        "title": "List Virtual Machines",
         "readOnlyHint": True,
         "destructiveHint": False,
         "idempotentHint": True,
@@ -381,7 +393,7 @@ async def utm_start_vm(params: StartVmInput) -> str:
         "title": "Suspend Virtual Machine",
         "readOnlyHint": False,
         "destructiveHint": False,
-        "idempotentHint": True,
+        "idempotentHint": False,
         "openWorldHint": False,
     },
 )
@@ -411,8 +423,8 @@ async def utm_suspend_vm(params: SuspendVmInput) -> str:
     annotations={
         "title": "Stop Virtual Machine",
         "readOnlyHint": False,
-        "destructiveHint": True,
-        "idempotentHint": True,
+        "destructiveHint": False,
+        "idempotentHint": False,
         "openWorldHint": False,
     },
 )
@@ -431,7 +443,11 @@ async def utm_stop_vm(params: StopVmInput) -> str:
         str: Confirmation message or error.
     """
     try:
-        args = ["stop", params.identifier, f"--{params.mode.value}"]
+        args = ["stop", params.identifier]
+        if params.mode == StopMode.KILL:
+            args.append("--kill")
+        elif params.mode == StopMode.REQUEST:
+            args.append("--request")
         output = await _run_utmctl(*args)
         return output or f"VM '{params.identifier}' stop ({params.mode.value}) command issued."
     except Exception as e:
@@ -529,9 +545,9 @@ async def utm_get_ip_address(params: VmIdentifierInput) -> str:
         return _format_error(e)
 
 
-# ---------------------------------------------------------------------------
+# ===========================================================================
 # Tools: Guest Operations
-# ---------------------------------------------------------------------------
+# ===========================================================================
 
 
 @mcp.tool(
@@ -547,8 +563,9 @@ async def utm_get_ip_address(params: VmIdentifierInput) -> str:
 async def utm_exec_command(params: ExecInput) -> str:
     """Execute a command inside a guest virtual machine.
 
-    Requires the QEMU/SPICE guest agent to be installed and running in the VM.
-    Returns the command's exit code and output.
+    Runs as root via the QEMU guest agent. Best for simple, single-line
+    commands. For multi-line scripts or complex logic, use utm_exec_script
+    instead.
 
     Args:
         params: VM identifier, command list, and optional environment variables.
@@ -565,6 +582,58 @@ async def utm_exec_command(params: ExecInput) -> str:
         args.extend(params.command)
         output = await _run_utmctl(*args)
         return output if output else "(command produced no output)"
+    except Exception as e:
+        return _format_error(e)
+
+
+@mcp.tool(
+    name="utm_exec_script",
+    annotations={
+        "title": "Execute Script on Guest",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": False,
+    },
+)
+async def utm_exec_script(params: ExecScriptInput) -> str:
+    """Push a script to a guest VM and execute it in one step.
+
+    Writes the script to a temp file on the guest, makes it executable,
+    runs it with the specified interpreter, captures combined stdout/stderr,
+    and cleans up the temp file. Runs as root.
+
+    Use this instead of utm_exec_command when you need multi-line logic,
+    pipelines, or complex shell constructs. Saves multiple round-trips
+    compared to file_push + exec_command.
+
+    Args:
+        params: VM identifier, script content, and optional interpreter.
+
+    Returns:
+        str: Script output (stdout + stderr) or error message.
+    """
+    try:
+        import uuid
+
+        script_path = f"/tmp/_mcp_script_{uuid.uuid4().hex[:8]}"
+
+        # Push script content to guest
+        await _run_utmctl(
+            "file", "push", params.identifier, script_path,
+            stdin_data=params.script,
+        )
+
+        # Make executable, run, capture output, clean up
+        exec_args = [
+            "exec", params.identifier, "--cmd",
+            "bash", "-c",
+            f"chmod +x {script_path} && "
+            f"{params.interpreter} {script_path} 2>&1; "
+            f"EXIT=$?; rm -f {script_path}; exit $EXIT",
+        ]
+        output = await _run_utmctl(*exec_args)
+        return output if output else "(script produced no output)"
     except Exception as e:
         return _format_error(e)
 
@@ -630,9 +699,9 @@ async def utm_file_push(params: FilePushInput) -> str:
         return _format_error(e)
 
 
-# ---------------------------------------------------------------------------
+# ===========================================================================
 # Tools: USB
-# ---------------------------------------------------------------------------
+# ===========================================================================
 
 
 @mcp.tool(
