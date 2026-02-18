@@ -1,6 +1,16 @@
 # UTM MCP Server
 
-An MCP (Model Context Protocol) server that provides tools for managing [UTM](https://mac.getutm.app/) virtual machines via the `utmctl` CLI.
+**Talk to your virtual machines.** Start, stop, inspect, and run commands inside your [UTM](https://mac.getutm.app/) VMs through natural conversation with an AI assistant.
+
+This MCP server connects Claude (or any MCP-compatible client) to UTM's `utmctl` CLI, letting you manage your entire VM fleet conversationally. Instead of memorizing CLI flags or switching between terminal windows, just ask: "start my Ubuntu server," "what's the IP of my dev box," or "run the migration script on staging."
+
+## What Can You Do?
+
+- **Manage VM lifecycle** -- start, stop, suspend, clone, and delete VMs by name
+- **Run commands on guests** -- execute shell commands and multi-line scripts inside running VMs
+- **Transfer files** -- push and pull files between your host and guest filesystems
+- **Query VM state** -- check status, get IP addresses, list all VMs
+- **USB passthrough** -- connect and disconnect USB devices to VMs
 
 ## Prerequisites
 
