@@ -16,6 +16,8 @@ Tools are grouped into three categories:
 import asyncio
 import logging
 import os
+import plistlib
+import random
 import shutil
 from enum import Enum
 from pathlib import Path
@@ -418,6 +420,114 @@ def _format_error(e: Exception) -> str:
     return f"Error: {type(e).__name__}: {e}"
 
 
+def _generate_random_mac() -> str:
+    """Generate a random locally-administered unicast MAC address.
+
+    Sets bit 1 (locally administered) and clears bit 0 (unicast) on the
+    first octet, matching the convention UTM uses for its MAC addresses.
+
+    Returns:
+        str: MAC address in the format "XX:XX:XX:XX:XX:XX".
+    """
+    first_byte = random.randint(0x00, 0xFF)
+    # Set locally-administered bit, clear multicast bit
+    first_byte = (first_byte | 0x02) & 0xFE
+    remaining = [random.randint(0x00, 0xFF) for _ in range(5)]
+    octets = [first_byte] + remaining
+    return ":".join(f"{b:02X}" for b in octets)
+
+
+def _find_vm_bundle(vm_name: str) -> Optional[Path]:
+    """Locate the .utm bundle directory for a VM by name.
+
+    Searches all known UTM storage locations and /Volumes.
+
+    Args:
+        vm_name: The VM name to search for.
+
+    Returns:
+        Path to the .utm bundle directory, or None if not found.
+    """
+    search_dirs = list(_UTM_STORAGE_CANDIDATES)
+    # Also scan /Volumes for external storage
+    volumes = Path("/Volumes")
+    if volumes.is_dir():
+        for vol in volumes.iterdir():
+            if vol.is_dir() and vol not in search_dirs:
+                search_dirs.append(vol)
+
+    for search_dir in search_dirs:
+        if not search_dir.is_dir():
+            continue
+        try:
+            for entry in search_dir.iterdir():
+                if entry.suffix == ".utm" and entry.is_dir():
+                    if entry.stem == vm_name:
+                        return entry
+        except PermissionError:
+            continue
+    return None
+
+
+def _randomize_clone_mac(clone_name: str) -> Optional[str]:
+    """Randomize MAC addresses in a cloned VM's config.plist.
+
+    Finds the VM bundle by name, reads its config.plist, replaces every
+    MacAddress in the Network array with a freshly generated random MAC,
+    and writes the plist back. The VM must be stopped.
+
+    Args:
+        clone_name: Name of the cloned VM.
+
+    Returns:
+        The new MAC address if successful, or None if the bundle or
+        network config could not be found.
+    """
+    bundle = _find_vm_bundle(clone_name)
+    if not bundle:
+        logger.warning("Could not find .utm bundle for '%s' to randomize MAC", clone_name)
+        return None
+
+    plist_path = bundle / "config.plist"
+    if not plist_path.exists():
+        logger.warning("No config.plist in %s", bundle)
+        return None
+
+    try:
+        with open(plist_path, "rb") as f:
+            config = plistlib.load(f)
+    except Exception as exc:
+        logger.error("Failed to read config.plist for '%s': %s", clone_name, exc)
+        return None
+
+    network_list = config.get("Network")
+    if not network_list or not isinstance(network_list, list):
+        logger.info("No Network entries in '%s', nothing to randomize", clone_name)
+        return None
+
+    new_mac = None
+    for iface in network_list:
+        if isinstance(iface, dict) and "MacAddress" in iface:
+            old_mac = iface["MacAddress"]
+            new_mac = _generate_random_mac()
+            iface["MacAddress"] = new_mac
+            logger.info(
+                "Randomized MAC for '%s': %s -> %s", clone_name, old_mac, new_mac
+            )
+
+    if new_mac is None:
+        return None
+
+    try:
+        with open(plist_path, "wb") as f:
+            plistlib.dump(config, f)
+    except Exception as exc:
+        logger.error("Failed to write config.plist for '%s': %s", clone_name, exc)
+        return None
+
+    return new_mac
+
+
 # ===========================================================================
 # Tools: VM Lifecycle
 # ===========================================================================
@@ -589,14 +699,17 @@ async def utm_clone_vm(params: CloneVmInput) -> str:
     """Clone an existing UTM virtual machine.
 
     Creates a full copy of the VM. Optionally specify a name for the clone.
-    Checks available disk space before cloning and warns if free space
-    would drop below the safety threshold (50 GB).
+    After cloning, the new VM's MAC address is randomized to prevent
+    network collisions with the source VM. Checks available disk space
+    before cloning and warns if free space would drop below the safety
+    threshold (50 GB).
 
     Args:
         params: Source VM identifier and optional clone name.
 
     Returns:
-        str: Confirmation message with storage details, or error.
+        str: Confirmation message with new MAC address and storage details,
+             or error.
     """
     try:
         warnings = []
@@ -634,6 +747,12 @@ async def utm_clone_vm(params: CloneVmInput) -> str:
             args.extend(["--name", params.name])
         output = await _run_utmctl(*args)
 
+        # Randomize MAC address to avoid collisions with the source VM.
+        # Determine the clone's name: explicit name if provided, otherwise
+        # UTM defaults to "<source> (Copy)".
+        clone_name = params.name if params.name else f"{params.identifier} (Copy)"
+        new_mac = _randomize_clone_mac(clone_name)
+
         # Build result with storage info
         result_parts = []
         if warnings:
@@ -641,6 +760,14 @@ async def utm_clone_vm(params: CloneVmInput) -> str:
             result_parts.append("")
 
         result_parts.append(output or f"VM '{params.identifier}' cloned successfully.")
+
+        if new_mac:
+            result_parts.append(f"MAC address randomized: {new_mac}")
+        else:
+            warnings.append(
+                "WARNING: Could not randomize MAC address on the clone. "
+                "Check for duplicate MACs before starting both VMs."
+            )
 
         if storage_path:
             free_after = _get_disk_free(str(storage_path))
