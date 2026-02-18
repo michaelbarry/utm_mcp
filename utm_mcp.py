@@ -15,7 +15,10 @@ Tools are grouped into three categories:
 
 import asyncio
 import logging
+import os
+import shutil
 from enum import Enum
+from pathlib import Path
 from typing import Optional, List
 
 from pydantic import BaseModel, Field, ConfigDict
@@ -246,6 +249,90 @@ class UsbDisconnectInput(BaseModel):
 # "file" and "usb" subcommands do NOT accept --hide.
 # "start" supports --hide but it causes ~7s delays and OSStatus -10004
 # errors on some UTM versions (Apple Events timeout), so we skip it.
+# Minimum free space (bytes) on the local disk before warning on clone.
+# Default 50 GB. Clones land on whatever volume UTM uses for storage.
+_LOW_DISK_THRESHOLD_BYTES = 50 * 1024 * 1024 * 1024
+
+# Known UTM VM storage locations (checked in order).
+_UTM_STORAGE_CANDIDATES = [
+    Path.home() / "Library" / "Containers" / "com.utmapp.UTM" / "Data" / "Documents",
+    Path.home() / "Library" / "Group Containers" / "WDNLXAD4W8.com.utmapp.UTM",
+]
+
+
+def _get_utm_storage_path() -> Optional[Path]:
+    """Return the UTM storage directory.
+
+    First checks for .utm bundles in known locations, then falls back to
+    scanning /Volumes for .utm bundles (UTM can be configured to store
+    VMs on external drives).
+    """
+    # Check default container locations
+    for candidate in _UTM_STORAGE_CANDIDATES:
+        if candidate.is_dir():
+            # Only return if it actually contains .utm bundles
+            if any(p.suffix == ".utm" for p in candidate.iterdir()):
+                return candidate
+
+    # Scan /Volumes for .utm bundles (external storage)
+    volumes = Path("/Volumes")
+    if volumes.is_dir():
+        for vol in volumes.iterdir():
+            if not vol.is_dir():
+                continue
+            try:
+                for entry in vol.iterdir():
+                    if entry.suffix == ".utm" and entry.is_dir():
+                        return vol
+            except PermissionError:
+                continue
+
+    # Last resort: check default candidates even without .utm bundles
+    for candidate in _UTM_STORAGE_CANDIDATES:
+        if candidate.is_dir():
+            return candidate
+
+    return None
+
+
+def _get_disk_free(path: str) -> int:
+    """Return free bytes on the filesystem containing *path*."""
+    return shutil.disk_usage(path).free
+
+
+def _format_bytes(n: int) -> str:
+    """Human-readable byte size."""
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if abs(n) < 1024:
+            return f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} PB"
+
+
+async def _estimate_vm_size(identifier: str) -> Optional[int]:
+    """Estimate the disk size of a VM by finding its .utm bundle.
+
+    Returns size in bytes, or None if the bundle can't be found.
+    """
+    storage = _get_utm_storage_path()
+    if not storage:
+        return None
+
+    # VM bundles are directories ending in .utm
+    for entry in storage.iterdir():
+        if entry.suffix == ".utm" and entry.is_dir():
+            # Match by name (the directory name minus .utm is often the VM name)
+            bundle_name = entry.stem
+            if bundle_name == identifier or identifier in bundle_name:
+                total = sum(
+                    f.stat().st_size
+                    for f in entry.rglob("*")
+                    if f.is_file()
+                )
+                return total
+    return None
+
+
 _HIDE_SUPPORTED_SUBCOMMANDS = {
     "list", "stop", "suspend", "delete", "clone",
     "status", "ip-address", "exec",
@@ -502,19 +589,69 @@ async def utm_clone_vm(params: CloneVmInput) -> str:
     """Clone an existing UTM virtual machine.
 
     Creates a full copy of the VM. Optionally specify a name for the clone.
+    Checks available disk space before cloning and warns if free space
+    would drop below the safety threshold (50 GB).
 
     Args:
         params: Source VM identifier and optional clone name.
 
     Returns:
-        str: Confirmation message or error.
+        str: Confirmation message with storage details, or error.
     """
     try:
+        warnings = []
+
+        # Estimate source VM size
+        vm_size = await _estimate_vm_size(params.identifier)
+
+        # Check where clones will land and available space
+        storage_path = _get_utm_storage_path()
+        if storage_path:
+            free_before = _get_disk_free(str(storage_path))
+
+            # Check if storage is on a small local volume (not external)
+            mount_point = str(storage_path)
+            is_external = mount_point.startswith("/Volumes/")
+            if not is_external:
+                warnings.append(
+                    "WARNING: UTM storage is on the local disk, not external storage. "
+                    "Clones will consume local disk space. Consider moving UTM storage "
+                    "to an external volume."
+                )
+
+            if vm_size and free_before - vm_size < _LOW_DISK_THRESHOLD_BYTES:
+                warnings.append(
+                    f"WARNING: Low disk space after clone. "
+                    f"VM size: ~{_format_bytes(vm_size)}, "
+                    f"Free now: {_format_bytes(free_before)}, "
+                    f"Free after: ~{_format_bytes(free_before - vm_size)}. "
+                    f"Threshold: {_format_bytes(_LOW_DISK_THRESHOLD_BYTES)}."
+                )
+
+        # Perform the clone
         args = ["clone", params.identifier]
         if params.name:
             args.extend(["--name", params.name])
         output = await _run_utmctl(*args)
-        return output or f"VM '{params.identifier}' cloned successfully."
+
+        # Build result with storage info
+        result_parts = []
+        if warnings:
+            result_parts.extend(warnings)
+            result_parts.append("")
+
+        result_parts.append(output or f"VM '{params.identifier}' cloned successfully.")
+
+        if storage_path:
+            free_after = _get_disk_free(str(storage_path))
+            result_parts.append(
+                f"Storage: {storage_path} "
+                f"(free: {_format_bytes(free_after)})"
+            )
+        if vm_size:
+            result_parts.append(f"Estimated clone size: ~{_format_bytes(vm_size)}")
+
+        return "\n".join(result_parts)
     except Exception as e:
         return _format_error(e)
 
