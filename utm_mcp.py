@@ -17,7 +17,6 @@ import asyncio
 import logging
 import os
 import plistlib
-import random
 import shutil
 from enum import Enum
 from pathlib import Path
@@ -260,6 +259,16 @@ _UTM_STORAGE_CANDIDATES = [
     Path.home() / "Library" / "Containers" / "com.utmapp.UTM" / "Data" / "Documents",
     Path.home() / "Library" / "Group Containers" / "WDNLXAD4W8.com.utmapp.UTM",
 ]
+_UTM_PREFERENCES_PATH = (
+    Path.home()
+    / "Library"
+    / "Containers"
+    / "com.utmapp.UTM"
+    / "Data"
+    / "Library"
+    / "Preferences"
+    / "com.utmapp.UTM.plist"
+)
 
 
 def _get_utm_storage_path() -> Optional[Path]:
@@ -420,21 +429,24 @@ def _format_error(e: Exception) -> str:
     return f"Error: {type(e).__name__}: {e}"
 
 
-def _generate_random_mac() -> str:
-    """Generate a random locally-administered unicast MAC address.
+def _is_regenerate_mac_on_clone_enabled() -> Optional[bool]:
+    """Return UTM's "Regenerate MAC addresses on clone" preference.
 
-    Sets bit 1 (locally administered) and clears bit 0 (unicast) on the
-    first octet, matching the convention UTM uses for its MAC addresses.
-
-    Returns:
-        str: MAC address in the format "XX:XX:XX:XX:XX:XX".
+    UTM stores this as `IsRegenerateMACOnClone` in its preferences plist.
+    Returns None when the value cannot be read.
     """
-    first_byte = random.randint(0x00, 0xFF)
-    # Set locally-administered bit, clear multicast bit
-    first_byte = (first_byte | 0x02) & 0xFE
-    remaining = [random.randint(0x00, 0xFF) for _ in range(5)]
-    octets = [first_byte] + remaining
-    return ":".join(f"{b:02X}" for b in octets)
+    try:
+        if not _UTM_PREFERENCES_PATH.exists():
+            return None
+        with open(_UTM_PREFERENCES_PATH, "rb") as f:
+            prefs = plistlib.load(f)
+        value = prefs.get("IsRegenerateMACOnClone")
+        if isinstance(value, bool):
+            return value
+        return False
+    except Exception as exc:
+        logger.warning("Failed to read UTM preferences from %s: %s", _UTM_PREFERENCES_PATH, exc)
+        return None
 
 
 def _find_vm_bundle(vm_name: str) -> Optional[Path]:
@@ -469,23 +481,59 @@ def _find_vm_bundle(vm_name: str) -> Optional[Path]:
     return None
 
 
-def _randomize_clone_mac(clone_name: str) -> Optional[str]:
-    """Randomize MAC addresses in a cloned VM's config.plist.
+def _find_vm_bundle_by_uuid(vm_uuid: str) -> Optional[Path]:
+    """Locate a VM bundle by the UUID stored in Information.UUID."""
+    needle = vm_uuid.strip().upper()
+    search_dirs = list(_UTM_STORAGE_CANDIDATES)
+    volumes = Path("/Volumes")
+    if volumes.is_dir():
+        for vol in volumes.iterdir():
+            if vol.is_dir() and vol not in search_dirs:
+                search_dirs.append(vol)
 
-    Finds the VM bundle by name, reads its config.plist, replaces every
-    MacAddress in the Network array with a freshly generated random MAC,
-    and writes the plist back. The VM must be stopped.
+    for search_dir in search_dirs:
+        if not search_dir.is_dir():
+            continue
+        try:
+            for entry in search_dir.iterdir():
+                if entry.suffix != ".utm" or not entry.is_dir():
+                    continue
+                plist_path = entry / "config.plist"
+                if not plist_path.exists():
+                    continue
+                try:
+                    with open(plist_path, "rb") as f:
+                        config = plistlib.load(f)
+                except Exception:
+                    continue
+                info = config.get("Information")
+                if not isinstance(info, dict):
+                    continue
+                uuid_value = info.get("UUID")
+                if isinstance(uuid_value, str) and uuid_value.upper() == needle:
+                    return entry
+        except PermissionError:
+            continue
+    return None
 
-    Args:
-        clone_name: Name of the cloned VM.
 
-    Returns:
-        The new MAC address if successful, or None if the bundle or
-        network config could not be found.
-    """
-    bundle = _find_vm_bundle(clone_name)
+def _resolve_vm_name(identifier: str) -> Optional[str]:
+    """Resolve a VM identifier (name or UUID) to a VM name."""
+    bundle = _find_vm_bundle(identifier)
+    if bundle:
+        return bundle.stem
+
+    bundle = _find_vm_bundle_by_uuid(identifier)
+    if bundle:
+        return bundle.stem
+    return None
+
+
+def _read_vm_mac_from_config(vm_name: str) -> Optional[str]:
+    """Read the first NIC MAC address from a VM bundle config."""
+    bundle = _find_vm_bundle(vm_name)
     if not bundle:
-        logger.warning("Could not find .utm bundle for '%s' to randomize MAC", clone_name)
+        logger.warning("Could not find .utm bundle for '%s' to read MAC", vm_name)
         return None
 
     plist_path = bundle / "config.plist"
@@ -497,35 +545,50 @@ def _randomize_clone_mac(clone_name: str) -> Optional[str]:
         with open(plist_path, "rb") as f:
             config = plistlib.load(f)
     except Exception as exc:
-        logger.error("Failed to read config.plist for '%s': %s", clone_name, exc)
+        logger.error("Failed to read config.plist for '%s': %s", vm_name, exc)
         return None
 
     network_list = config.get("Network")
     if not network_list or not isinstance(network_list, list):
-        logger.info("No Network entries in '%s', nothing to randomize", clone_name)
+        logger.info("No Network entries in '%s'", vm_name)
         return None
 
-    new_mac = None
     for iface in network_list:
-        if isinstance(iface, dict) and "MacAddress" in iface:
-            old_mac = iface["MacAddress"]
-            new_mac = _generate_random_mac()
-            iface["MacAddress"] = new_mac
-            logger.info(
-                "Randomized MAC for '%s': %s -> %s", clone_name, old_mac, new_mac
-            )
+        if not isinstance(iface, dict):
+            continue
+        mac = iface.get("MacAddress")
+        if isinstance(mac, str) and mac:
+            return mac
+    return None
 
-    if new_mac is None:
-        return None
 
-    try:
-        with open(plist_path, "wb") as f:
-            plistlib.dump(config, f)
-    except Exception as exc:
-        logger.error("Failed to write config.plist for '%s': %s", clone_name, exc)
-        return None
-
-    return new_mac
+def _clone_mac_manual_intervention_steps(source_id: str, clone_name: str) -> List[str]:
+    """Return user-facing remediation steps for clone MAC issues."""
+    return [
+        "BLOCKING_STATUS:",
+        "Do not run source and clone together until MAC remediation is complete.",
+        "Treat this clone as unsafe for shared-network use until validation passes.",
+        "",
+        "MANUAL_ACTION_REQUIRED:",
+        "1. Stop the clone VM: utm_stop_vm(identifier=\"%s\")" % clone_name,
+        "2. Delete the bad clone: utm_delete_vm(identifier=\"%s\")" % clone_name,
+        "3. In UTM app, enable: Settings > QEMU > Regenerate MAC addresses on clone.",
+        "4. Fully quit/reopen UTM.",
+        "5. Re-clone from source: utm_clone_vm(identifier=\"%s\", name=\"%s\")" % (
+            source_id,
+            clone_name,
+        ),
+        "6. If you intentionally want to replace the original VM, delete it only after validation succeeds.",
+        "",
+        "VALIDATE:",
+        "1. Start source and clone VMs.",
+        "2. On each guest run: ip -o link show | awk '/link\\/ether/ {print $2, $17}'",
+        "3. Confirm the NIC MAC address shown by the clone is different from the source.",
+        "",
+        "GOING_FORWARD:",
+        "1. Keep 'Regenerate MAC addresses on clone' enabled in UTM.",
+        "2. Validate source vs clone MAC after each clone before using both simultaneously.",
+    ]
 
 
 # ===========================================================================
@@ -699,16 +762,17 @@ async def utm_clone_vm(params: CloneVmInput) -> str:
     """Clone an existing UTM virtual machine.
 
     Creates a full copy of the VM. Optionally specify a name for the clone.
-    After cloning, the new VM's MAC address is randomized to prevent
-    network collisions with the source VM. Checks available disk space
-    before cloning and warns if free space would drop below the safety
-    threshold (50 GB).
+    UTM can regenerate clone MAC addresses natively when the
+    "Regenerate MAC addresses on clone" preference is enabled. This tool
+    checks that setting and reports the clone MAC address from config.plist.
+    Also checks available disk space before cloning and warns if free
+    space would drop below the safety threshold (50 GB).
 
     Args:
         params: Source VM identifier and optional clone name.
 
     Returns:
-        str: Confirmation message with new MAC address and storage details,
+        str: Confirmation message with clone MAC/storage details,
              or error.
     """
     try:
@@ -741,17 +805,44 @@ async def utm_clone_vm(params: CloneVmInput) -> str:
                     f"Threshold: {_format_bytes(_LOW_DISK_THRESHOLD_BYTES)}."
                 )
 
+        mac_regen_enabled = _is_regenerate_mac_on_clone_enabled()
+        if mac_regen_enabled is False:
+            warnings.append(
+                "WARNING: UTM setting 'Regenerate MAC addresses on clone' is disabled. "
+                "The clone may keep the source MAC. Enable it in UTM > Settings > QEMU."
+            )
+        elif mac_regen_enabled is None:
+            warnings.append(
+                "WARNING: Could not read UTM preference 'IsRegenerateMACOnClone'. "
+                "Unable to verify whether clone MAC regeneration is enabled."
+            )
+
         # Perform the clone
         args = ["clone", params.identifier]
         if params.name:
             args.extend(["--name", params.name])
         output = await _run_utmctl(*args)
 
-        # Randomize MAC address to avoid collisions with the source VM.
-        # Determine the clone's name: explicit name if provided, otherwise
-        # UTM defaults to "<source> (Copy)".
-        clone_name = params.name if params.name else f"{params.identifier} (Copy)"
-        new_mac = _randomize_clone_mac(clone_name)
+        source_name = _resolve_vm_name(params.identifier)
+        clone_name = params.name if params.name else (
+            f"{source_name} (Copy)" if source_name else f"{params.identifier} (Copy)"
+        )
+        source_mac = _read_vm_mac_from_config(source_name) if source_name else None
+        clone_mac = _read_vm_mac_from_config(clone_name)
+        if not clone_mac:
+            warnings.append(
+                f"WARNING: Could not read clone MAC from config.plist for '{clone_name}'."
+            )
+
+        manual_intervention_reasons = []
+        if mac_regen_enabled is False:
+            manual_intervention_reasons.append(
+                "UTM setting 'Regenerate MAC addresses on clone' is disabled."
+            )
+        if source_mac and clone_mac and source_mac.upper() == clone_mac.upper():
+            manual_intervention_reasons.append(
+                f"Duplicate MAC detected: source and clone both use {clone_mac}."
+            )
 
         # Build result with storage info
         result_parts = []
@@ -761,12 +852,24 @@ async def utm_clone_vm(params: CloneVmInput) -> str:
 
         result_parts.append(output or f"VM '{params.identifier}' cloned successfully.")
 
-        if new_mac:
-            result_parts.append(f"MAC address randomized: {new_mac}")
-        else:
-            warnings.append(
-                "WARNING: Could not randomize MAC address on the clone. "
-                "Check for duplicate MACs before starting both VMs."
+        if clone_mac:
+            result_parts.append(f"Clone MAC address (config.plist): {clone_mac}")
+        if source_mac:
+            result_parts.append(f"Source MAC address (config.plist): {source_mac}")
+        if mac_regen_enabled is True:
+            result_parts.append("UTM native clone MAC regeneration is enabled.")
+        if manual_intervention_reasons:
+            result_parts.append("")
+            result_parts.append("MAC_CLONE_REMEDIATION_REASON:")
+            result_parts.extend(f"- {reason}" for reason in manual_intervention_reasons)
+            result_parts.append("")
+            result_parts.append("BLOCKING:")
+            result_parts.append(
+                "Do not proceed with this clone in shared-network scenarios until remediation and validation are complete."
+            )
+            result_parts.append("")
+            result_parts.extend(
+                _clone_mac_manual_intervention_steps(params.identifier, clone_name)
             )
 
         if storage_path:
@@ -1084,10 +1187,101 @@ async def utm_disconnect_usb(params: UsbDisconnectInput) -> str:
         return _format_error(e)
 
 
+# ===========================================================================
+# Prompts: Troubleshooting
+# ===========================================================================
+
+
+@mcp.prompt(
+    name="fix_efi_storage_error",
+    description=(
+        "Diagnose and fix the 'edk2-arm-vars.fd doesn't exist' error that "
+        "occurs after moving a UEFI VM to external storage via UTM's Move "
+        "command. Provides diagnostic steps and the symlink fix."
+    ),
+)
+def fix_efi_storage_error(vm_name: str) -> str:
+    """Generate instructions to fix the EFI vars path error after VM relocation.
+
+    When UTM's Move command relocates a QEMU UEFI VM to an external drive,
+    it can fail to update the internal path for efi_vars.fd. The VM then
+    fails to start with "edk2-arm-vars.fd doesn't exist." The fix is a
+    symlink from the expected Documents path to the actual external location.
+
+    Args:
+        vm_name: Name of the VM that fails to start.
+
+    Returns:
+        str: Diagnostic and fix instructions.
+    """
+    documents_dir = (
+        "~/Library/Containers/com.utmapp.UTM/Data/Documents"
+    )
+
+    return (
+        f'## Fix: "edk2-arm-vars.fd doesn\'t exist" for VM "{vm_name}"\n'
+        f"\n"
+        f"This error occurs after using UTM's Move command to relocate a UEFI VM\n"
+        f"to external storage. UTM loses the path reference for the EFI variable store.\n"
+        f"\n"
+        f"### Step 1: Confirm the root cause\n"
+        f"\n"
+        f"Check macOS logs for the path mismatch (run on the host):\n"
+        f"\n"
+        f"```bash\n"
+        f'log show --predicate \'process == "UTM" OR process == "qemu"\' --last 2m \\\n'
+        f'  | grep -i "edk2\\|efi_vars\\|pflash\\|doesn\'t exist\\|error"\n'
+        f"```\n"
+        f"\n"
+        f"Look for a line showing UTM trying to open `efi_vars.fd` at the\n"
+        f"**default Documents path** instead of the external drive. This confirms\n"
+        f"the path reference was not updated during the move.\n"
+        f"\n"
+        f"### Step 2: Find the VM bundle on the external drive\n"
+        f"\n"
+        f"Locate the `.utm` bundle on the external volume:\n"
+        f"\n"
+        f"```bash\n"
+        f'find /Volumes -maxdepth 2 -name "{vm_name}.utm" -type d 2>/dev/null\n'
+        f"```\n"
+        f"\n"
+        f"### Step 3: Create the symlink\n"
+        f"\n"
+        f"```bash\n"
+        f"mkdir -p {documents_dir}\n"
+        f"\n"
+        f'ln -s "/Volumes/<DRIVE_NAME>/{vm_name}.utm" \\\n'
+        f'      {documents_dir}/"{vm_name}.utm"\n'
+        f"```\n"
+        f"\n"
+        f"Replace `<DRIVE_NAME>` with the actual volume name from Step 2.\n"
+        f"\n"
+        f"### Step 4: Start the VM\n"
+        f"\n"
+        f"The VM should start immediately -- no UTM restart required.\n"
+        f"Call `utm_start_vm` with identifier: \"{vm_name}\"\n"
+        f"\n"
+        f"### What does NOT work\n"
+        f"\n"
+        f"- Checking 'Reset UEFI Variables' in VM settings\n"
+        f"- Copying edk2-arm-vars.fd into the VM's Data/ directory\n"
+        f"- Creating a symlink for edk2-arm-vars.fd inside Data/\n"
+        f"- Editing config.plist (no EFI path reference exists)\n"
+        f"- Renaming efi_vars.fd to edk2-arm-vars.fd\n"
+        f"\n"
+        f"### Notes\n"
+        f"\n"
+        f"- Affected: QEMU backend, aarch64 with UEFI boot, UTM 4.7.x+\n"
+        f"- If the external drive is later unmounted, the symlink becomes dangling\n"
+        f"  and the VM will fail to start until the drive is reconnected.\n"
+        f"- This is a UTM bug: sandbox security-scoped bookmarks don't cover the\n"
+        f"  efi_vars.fd initialization during startup.\n"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Entry Point
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     mcp.run()
-
